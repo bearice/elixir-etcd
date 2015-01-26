@@ -7,6 +7,10 @@ defmodule Etcd do
     defexception [:code,:message]
   end
 
+  defmodule AsyncReply do
+    defstruct id: nil, reply: nil
+  end
+
   def dir(srv, root,recursive \\ false) do
     ls!(srv, false, true, recursive)
   end
@@ -80,14 +84,52 @@ defmodule Etcd do
 
   defmodule Watcher do
     use GenServer
-    def start_link(conn, key, opts \\ []) do
-      GenServer.start_link __MODULE__, %{conn: conn, key: key, opts: opts}
+    def start_link(conn, key, opts) do
+      GenServer.start_link __MODULE__, %{conn: conn, key: key, opts: opts, id: nil, index: nil, notify: self}
+    end
+    def stop(pid) do
+      GenServer.call pid, :stop
     end
     def init(ctx) do
+      ctx = init_request(ctx)
       {:ok, ctx}
     end
     def handle_call(:stop,_,ctx) do
       {:stop,:normal,:ok,ctx}
+    end
+    def handle_info(%Etcd.AsyncReply{id: id, reply: reply},ctx) do
+      case reply do
+        {:ok, obj} ->
+          Logger.debug inspect obj
+          node = obj["node"]
+          index = node["modifiedIndex"]
+          ctx = %{ctx| index: index}
+          #:timer.sleep(1000)
+          ctx = init_request(ctx)
+          send ctx.notify, {:watcher_notify, obj}
+          {:noreply, ctx}
+        {:empty, %{headers: hdr}} ->
+          Logger.debug "Empty response, retry..."
+          index = String.to_integer hdr["X-Etcd-Index"]
+          ctx = %{ctx| index: index}
+          ctx = init_request(ctx)
+        {:error,{:closed, _}} ->
+          Logger.debug "Connection closed, retry..."
+          ctx = init_request(ctx)
+          {:noreply, ctx}
+        {:error, err} ->
+          Logger.warn "Watcher error: #{inspect err}"
+          send ctx.notify, {:watcher_error, err}
+          {:stop,err}
+      end
+    end
+    defp init_request(ctx) do
+      opts = Dict.put ctx.opts, :wait, true
+      if ctx.index do
+        opts = Dict.put ctx.opts, :waitIndex, ctx.index+1
+      end
+      id = Etcd.Connection.request_async(ctx.conn, :get, ctx.key, opts)
+      %{ctx| id: id, opts: opts}
     end
   end
 end
@@ -134,8 +176,8 @@ defmodule Etcd.Connection do
   end
 
   def handle_cast({id, pid, method, path, payload}, ctx) do
+    from = {:async, id, pid}
     try do
-      from = {:async, id, pid}
       req = make_request ctx.server, method, path, payload, from
       send_request! ctx, req
     rescue
@@ -168,7 +210,7 @@ defmodule Etcd.Connection do
   end
 
   defp reply({:async, id, from}, reply) do
-    send from, %Etcd.AsyncReply{:id: id, :reply: reply}
+    send from, %Etcd.AsyncReply{id: id, reply: reply}
   end
 
   defp reply(from, reply) do
@@ -181,6 +223,7 @@ defmodule Etcd.Connection do
         :ets.delete table,id
         cb.(req,resp)
       _ ->
+        Logger.warn "Not found: #{inspect id}"
         :error
     end
   end
@@ -194,6 +237,7 @@ defmodule Etcd.Connection do
         resp = Dict.update(resp, field, value, fun)
         :ets.insert table, {id, from, resp}
       _ ->
+        Logger.warn "Not found: #{inspect id}"
         :error
     end
   end
@@ -224,10 +268,11 @@ defmodule Etcd.Connection do
     %AsyncResponse{id: id} = HTTPoison.request!(
       req.method, req.url, req.query, req.header, req.options
     )
-    :ets.insert ctx.table, {id, req, %{}}
+    :ets.insert ctx.table, {id, req, %{body: ""}}
   end
 
   defp process_response(ctx, req, resp) do
+    IO.inspect resp
     case resp do
       %{status_code: 307, headers: hdr } ->
         next = Map.get hdr, "Location"
@@ -240,69 +285,17 @@ defmodule Etcd.Connection do
           reply req.from, {:error, :badarg}
         end
 
-      %{status_code: code, body: resp} ->
+      %{status_code: 200,  body: ""} ->
+        reply req.from, {:empty, resp}
+      %{status_code: code, body: body} ->
         Logger.debug "get #{code}"
         try do
-          reply req.from, {:ok, JSX.decode!(resp)}
+          reply req.from, {:ok, JSX.decode!(body)}
         rescue
           ArgumentError ->
-            Logger.error "Bad response [#{code}]: #{resp}"
+            Logger.error "Bad response [#{code}]: #{inspect resp}"
             reply req.from, {:error,:badarg}
         end
     end
   end
 end
-
-defmodule Etcd.Node do
-  @derive [Access,Collectable]
-  defstruct [
-    dir: false,
-    key: nil,
-    nodes: nil,
-    createdIndex: nil,
-    modifiedIndex: nil,
-    ttl: nil,
-    expiration: nil,
-  ]
-
-  def from_map(map) do
-      load_nodes(Enum.into(map, %Etcd.Node{}, fn({k,v})->{String.to_existing_atom(k),v} end))
-  end
-
-  defp load_nodes(%{dir: false} = node), do: node
-  defp load_nodes(%{dir: true} = node), do: %{node | nodes: load_nodes(node.nodes) }
-  defp load_nodes(nil), do: nil
-  defp load_nodes(lst) when is_list(lst), do: Enum.map(lst, &from_map/1)
-end
-
-defmodule Etcd.Server do
-  require Logger
-  defstruct url: "http://127.0.0.1:4001", ssl_options: [] 
-
-
-  defp fetch_response(server, method, url, query, header, opts) do
-    ret = HTTPoison.request method, url, query, header, opts
-    #IO.inspect ret
-    case ret do
-      {:error,err} ->
-        Logger.error "request error: #{err.message}"
-        {:error,err}
-      {:ok, resp} ->
-        process_response server, resp 
-    end
-  end
-
-  def mkurl(server, path) do
-    server.url <> "/v2/keys" <> path
-  end
-
-  def mkopts(server) do
-    [
-      hackney: [
-        ssl_options: server.ssl_options,
-      ],
-    ]
-  end
-end
-
-
