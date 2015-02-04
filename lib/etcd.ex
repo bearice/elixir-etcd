@@ -9,7 +9,7 @@ defmodule Etcd do
 
   defmodule AsyncReply do
     defstruct id: nil, reply: nil
-  end
+  end #defmodule AsyncReply
 
   def dir(srv, root,recursive \\ false) do
     ls!(srv, false, true, recursive)
@@ -40,42 +40,42 @@ defmodule Etcd do
     end
   end
 
-  def get!(srv, key, opts \\ []) do
-    Node.from_map raw_get!(srv, key, opts)
+  def get!(srv, key, query \\ []) do
+    Node.from_map raw_get!(srv, key, query)
   end
 
   def getAll!(srv, key \\ "/") do
     get!(srv, key, [recursive: true])
   end
 
-  defp raw_get!(srv, key, opts) do
-    %{"node" => node} = request! srv, :get, key, opts
+  defp raw_get!(srv, key, query) do
+    %{"node" => node} = request! srv, :get, key, query, []
     node
   end
 
-  def put!(srv, key, value, opts \\ []) do
-    opts = Dict.put(opts, :value, value)
-    request! srv, :put, key, opts
+  def put!(srv, key, value, body \\ []) do
+    body = Dict.put(body, :value, value)
+    request! srv, :put, key, [], body
   end
 
-  def delete!(srv, key, opts \\ []) do
-    request! srv, :delete, key, opts
+  def delete!(srv, key, body \\ []) do
+    request! srv, :delete, key, [], body
   end
 
-  def wait!(srv, key, opts \\ [], timeout \\ 10000) do
-    opts = Dict.put(opts, :wait, true)
-    request! srv, :get, key, opts, timeout
+  def wait!(srv, key, body \\ [], timeout \\ 10000) do
+    body = Dict.put(body, :wait, true)
+    request! srv, :get, key, [], body, timeout
   end
 
   def watch(srv, key, opts) do
 
   end
 
-  defp request!(srv, verb, key, opts, timeout \\ 5000) do
-    case Connection.request(srv, verb, key, opts, timeout) do
-      {:ok,%{"action" => _action}=reply} ->
+  defp request!(srv, verb, key, query \\ [], body \\ [], timeout \\ 5000) do
+    case Connection.request(srv, :sync, verb, key, query, body, timeout) do
+      {:ok,%{"action" => _action}=reply,_} ->
         reply
-      {:ok,%{"errorCode" => errCode, "message" => errMsg}} ->
+      {:ok,%{"errorCode" => errCode, "message" => errMsg},_} ->
         raise ServerError, code: errCode, message: errMsg
       {:error,e} ->
         raise e
@@ -99,7 +99,7 @@ defmodule Etcd do
     end
     def handle_info(%Etcd.AsyncReply{id: id, reply: reply},ctx) do
       case reply do
-        {:ok, obj} ->
+        {:ok, obj, resp} ->
           Logger.debug inspect obj
           node = obj["node"]
           index = node["modifiedIndex"]
@@ -108,11 +108,6 @@ defmodule Etcd do
           ctx = init_request(ctx)
           send ctx.notify, {:watcher_notify, obj}
           {:noreply, ctx}
-        {:empty, %{headers: hdr}} ->
-          Logger.debug "Empty response, retry..."
-          index = String.to_integer hdr["X-Etcd-Index"]
-          ctx = %{ctx| index: index}
-          ctx = init_request(ctx)
         {:error,{:closed, _}} ->
           Logger.debug "Connection closed, retry..."
           ctx = init_request(ctx)
@@ -128,7 +123,7 @@ defmodule Etcd do
       if ctx.index do
         opts = Dict.put ctx.opts, :waitIndex, ctx.index+1
       end
-      id = Etcd.Connection.request_async(ctx.conn, :get, ctx.key, opts)
+      id = Etcd.Connection.request(ctx.conn, :async, :get, ctx.key, opts, [])
       %{ctx| id: id, opts: opts}
     end
   end
@@ -137,27 +132,24 @@ end
 defmodule Etcd.Connection do
   use GenServer
   require Logger
-  alias Etcd.Server
-  alias HTTPoison.AsyncResponse
-  alias HTTPoison.AsyncStatus
-  alias HTTPoison.AsyncHeaders
-  alias HTTPoison.AsyncChunk
-  alias HTTPoison.AsyncEnd
-  alias HTTPoison.Response
-  alias HTTPoison.Error
+  alias Etcd.AsyncReply
 
-  def request(conn, method, path, opts, timeout \\ 5000) do
-    GenServer.call conn, {method, path, opts}, timeout
+  defstruct schema: "http", hosts: ["127.0.0.1:4001"], prefix: "/v2/keys", ssl_options: []
+
+  defmodule Request do
+    defstruct mode: :sync, method: :get, path: nil, query: nil, body: nil, headers: [], opts: [], id: nil, from: nil, stream_to: nil
+  end #defmodule Request
+
+  def request(conn, mode, method, path, query, body, timeout \\ 5000) do
+    GenServer.call conn, %Request{mode: mode, method: method, path: path, query: query, body: body}, timeout
   end
 
-  def request_async(conn, method, path, opts) do
-    id = make_ref
-    :ok = GenServer.cast conn, {id, self, method, path, opts}
-    id
+  def request(conn, %Request{}=req, timeout \\ 5000) do
+    GenServer.call conn, req, timeout
   end
 
-  def start_link(srv) do
-    GenServer.start_link __MODULE__,srv
+  def start_link(uri) do
+    GenServer.start_link __MODULE__,uri
   end
 
   def init(srv) do
@@ -165,62 +157,64 @@ defmodule Etcd.Connection do
     {:ok, %{:server => srv, :table => table}}
   end
 
-  def handle_call({method,path,payload}, from, ctx) do
-    try do
-      req = make_request ctx.server, method, path, payload, from
-      send_request! ctx, req
+  def handle_call(req, from, ctx) do
+    reply = mkreq ctx, req, from
+    if req.mode == :async do
+      {:reply, reply, ctx}
+    else
       {:noreply,ctx}
-    rescue
-      e -> {:reply,{:error,e},ctx}
     end
+  rescue
+    err ->
+      Logger.error "#{Exception.message err}\n#{Exception.format_stacktrace System.stacktrace}"
+      {:reply,{:error,err},ctx}
   end
 
-  def handle_cast({id, pid, method, path, payload}, ctx) do
-    from = {:async, id, pid}
-    try do
-      req = make_request ctx.server, method, path, payload, from
-      send_request! ctx, req
-    rescue
-      e -> reply from,{:error,e}
-    end
-    {:noreply, ctx}
-  end
-
-  def handle_info(%AsyncStatus{id: id, code: code}, ctx) do
-    update_resp(ctx.table, id, :status_code, code)
+  def handle_info({:hackney_response, id, {:status, code, reason}}, ctx) do
+    update_resp(ctx, id, :status_code, code)
     {:noreply,ctx}
   end
-  def handle_info(%AsyncHeaders{id: id, headers: hdr}, ctx) do
-    update_resp(ctx.table, id, :headers, hdr)
+  def handle_info({:hackney_response, id, {:headers, hdr}}, ctx) do
+    update_resp(ctx, id, :headers, hdr)
     {:noreply,ctx}
   end
-  def handle_info(%AsyncChunk{id: id, chunk: chunk}, ctx) do
-    update_resp(ctx.table, id, :body, chunk, fn(parts)-> parts <> chunk end)
+  def handle_info({:hackney_response, id, chunk}, ctx) when is_binary(chunk) do
+    update_resp(ctx, id, :body, chunk, fn(parts)-> parts <> chunk end)
     {:noreply,ctx}
   end
-  def handle_info(%AsyncEnd{id: id}, ctx) do
-    finish_resp ctx.table, id, &(process_response(ctx.server, &1, &2))
+  def handle_info({:hackney_response, id, :done}, ctx) do
+    finish_resp ctx, id, &(process_response(ctx, &1, &2))
     {:noreply,ctx}
   end
-  def handle_info(%Error{id: id, reason: reason}, ctx) do
-    finish_resp ctx.table, id, fn(req, resp) ->
-      reply req.from, {:error, reason}
+  def handle_info({:hackney_response, id, {:redirect, to, _hdrs}}, ctx) do
+    Logger.debug "Redirecting #{inspect id} to #{to}"
+    {:noreply,ctx}
+  end
+  def handle_info({:hackney_response, id, {:error, reason}}, ctx) do
+    finish_resp ctx, id, fn(req, resp) ->
+      reply req, {:error, reason}
     end
     {:noreply,ctx}
   end
 
-  defp reply({:async, id, from}, reply) do
-    send from, %Etcd.AsyncReply{id: id, reply: reply}
+  defp reply(req, reply) do
+    case req.mode do
+      :async ->
+        pid = if req.stream_to do
+          req.stream_to
+        else
+          elem req.from, 0
+        end
+        send pid, %AsyncReply{id: req.id, reply: reply}
+      :sync ->
+        GenServer.reply req.from, reply
+    end
   end
 
-  defp reply(from, reply) do
-    GenServer.reply from, reply
-  end
-
-  defp finish_resp(table, id, cb) do
-    case :ets.lookup(table,id) do
+  defp finish_resp(ctx, id, cb) do
+    case :ets.lookup(ctx.table,id) do
       [{^id, req, resp}]->
-        :ets.delete table,id
+        :ets.delete ctx.table,id
         cb.(req,resp)
       _ ->
         Logger.warn "Not found: #{inspect id}"
@@ -228,74 +222,87 @@ defmodule Etcd.Connection do
     end
   end
 
-  defp update_resp(table, id, field, value, fun \\ nil) do
+  defp update_resp(ctx, id, field, value, fun \\ nil) do
     unless fun do
       fun = fn(_any) -> value end
     end
-    case :ets.lookup(table,id) do
+    case :ets.lookup(ctx.table,id) do
       [{^id, from, resp}]->
         resp = Dict.update(resp, field, value, fun)
-        :ets.insert table, {id, from, resp}
+        :ets.insert ctx.table, {id, from, resp}
       _ ->
         Logger.warn "Not found: #{inspect id}"
         :error
     end
   end
 
-  def make_request(server, method, path, payload, from) do
-    url = Server.mkurl server, path
-    query = URI.encode_query payload
-    header = [{"Content-Type","application/x-www-form-urlencoded"}]
-    if method == :get do
-      if query != "" do
-        url = url <> "?" <> query
-      end
-      query = []
-      header = []
+  defp mkurl(ctx, req) do
+    uri = ctx.server
+    ret = uri.schema <> "://" <> hd(uri.hosts) <> uri.prefix <> req.path
+    if req.query do
+      ret <> "?" <> URI.encode_query req.query
+    else
+      ret
     end
-    Logger.debug "#{method} #{url} #{query}"
-    %{
-      method: method,
-      url: url,
-      header: header,
-      query: query,
-      options: Server.mkopts(server)++[stream_to: self],
-      from: from,
-    }
   end
 
-  defp send_request!(ctx, req) do
-    %AsyncResponse{id: id} = HTTPoison.request!(
-      req.method, req.url, req.query, req.header, req.options
-    )
-    :ets.insert ctx.table, {id, req, %{body: ""}}
+  defp mkhdrs(ctx, req) do
+    if req.body do
+      Enum.into req.headers,[{"Content-Type","application/x-www-form-urlencoded"}]
+    else
+      req.headers
+    end
+  end
+
+  defp mkbody(ctx, req) do
+    if req.body do
+      URI.encode_query req.body
+    else
+      ""
+    end
+  end
+
+  defp mkopts(ctx, opts) do
+    uri = ctx.server
+    opts
+    |> Dict.put(:ssl_options, uri.ssl_options)
+    |> Dict.put(:stream_to, self())
+    |> Dict.put(:follow_redirect, true)
+    |> Dict.put(:force_redirect, true)
+    |> Dict.put(:async, :true)
+  end
+
+
+  defp mkreq(ctx, req, from) do
+    method  = req.method
+    url     = mkurl  ctx, req
+    headers = mkhdrs ctx, req
+    body    = mkbody ctx, req
+    options = mkopts ctx, req.opts
+
+    Logger.debug "#{method} #{url} #{inspect headers} #{inspect body} #{inspect options}"
+    case :hackney.request(method, url, headers, body, options) do
+      {:ok, id} ->
+        req = %{req| from: from, id: id}
+        :ets.insert ctx.table, {id, req, %{body: ""}}
+        {:ok, id}
+      {:error, e} ->
+        raise e
+    end
   end
 
   defp process_response(ctx, req, resp) do
     IO.inspect resp
-    case resp do
-      %{status_code: 307, headers: hdr } ->
-        next = Map.get hdr, "Location"
-        if next do
-          Logger.debug "got 307, goto #{next}"
-          req = Dict.put req, :url, next
-          send_request! ctx, req
-        else
-          Logger.warn "Redirection without location header!"
-          reply req.from, {:error, :badarg}
-        end
-
-      %{status_code: 200,  body: ""} ->
-        reply req.from, {:empty, resp}
-      %{status_code: code, body: body} ->
-        Logger.debug "get #{code}"
-        try do
-          reply req.from, {:ok, JSX.decode!(body)}
-        rescue
-          ArgumentError ->
-            Logger.error "Bad response [#{code}]: #{inspect resp}"
-            reply req.from, {:error,:badarg}
-        end
-    end
+    Logger.debug "get #{resp.status_code}"
+    body = JSX.decode! resp.body
+    reply req, {:ok, body, resp}
+  rescue err ->
+    Logger.error "Bad response: #{inspect resp}\n#{Exception.message err}\n#{Exception.format_stacktrace System.stacktrace}"
+    reply req, {:error, err}
   end
 end
+
+defmodule Etcd.URI do
+  require Logger
+end
+
