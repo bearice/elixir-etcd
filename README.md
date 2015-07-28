@@ -5,8 +5,8 @@ ElixirEtcd
 
 require Logger
 
-server = %Etcd.Server{
-  url: "http://127.0.0.1:4001",
+server = %Etcd.Connection{
+  hosts: ["127.0.0.1:4001"],
   ssl_options: [
     {:certfile, 'etcd_client.crt'},
     {:keyfile, 'etcd_client.key'},
@@ -14,7 +14,7 @@ server = %Etcd.Server{
 }
 
 {:ok,conn} = Etcd.Connection.start_link server
-#IO.inspect Etcd.Server.request(server,:get,"/test/foobar/xx/yy")
+#IO.inspect Etcd.Connection.request(server,:get,"/test/foobar/xx/yy")
 IO.inspect Etcd.get? conn,"/test"
 IO.inspect Etcd.put! conn,"/test","hello world"
 IO.inspect Etcd.put! conn,"/test","hello", [prevValue: "hello world"]
