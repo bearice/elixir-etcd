@@ -62,9 +62,9 @@ defmodule Etcd do
     request! srv, :delete, key, [], body
   end
 
-  def wait!(srv, key, body \\ [], timeout \\ 10000) do
-    body = Dict.put(body, :wait, true)
-    request! srv, :get, key, [], body, timeout
+  def wait!(srv, key, query \\ [], timeout \\ 10000) do
+    query = Dict.put(query, :wait, true)
+    request! srv, :get, key, query, [], timeout
   end
 
   def watch(srv, key, opts) do
