@@ -29,7 +29,7 @@ defmodule ElixirEtcd.Mixfile do
   defp deps do
     [
       {:exjsx, "~> 3.0"},
-      {:httpoison, "~> 0.5.0"},
+      {:httpoison, "~> 0.7"},
     ]
   end
 
