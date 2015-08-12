@@ -4,7 +4,7 @@ defmodule Etcd do
   alias Etcd.Node
 
   defmodule ServerError do
-    defexception [:code,:message]
+    defexception [:code,:message,:cause,:index]
   end
 
   defmodule AsyncReply do
@@ -75,8 +75,8 @@ defmodule Etcd do
     case Connection.request(srv, :sync, verb, key, query, body, timeout) do
       {:ok,%{"action" => _action}=reply,_} ->
         reply
-      {:ok,%{"errorCode" => errCode, "message" => errMsg},_} ->
-        raise ServerError, code: errCode, message: errMsg
+      {:ok,%{"errorCode" => errCode, "message" => errMsg, "index" => index}=reply,_} ->
+        raise ServerError, code: errCode, message: errMsg, cause: Map.get(reply, "cause", nil), index: index
       {:error,e} ->
         raise e
     end
