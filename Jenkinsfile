@@ -4,7 +4,7 @@ pipeline {
   stages {
     stage("ENV VARS") {
       steps {
-        println "${env}"
+	sh "env | sort"
       }
     }
   }
